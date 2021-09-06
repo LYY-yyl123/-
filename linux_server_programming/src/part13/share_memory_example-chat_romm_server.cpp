@@ -53,7 +53,7 @@ int setnonblocking (int fd)
     return old_option;
 }
 
-void addfd(int epollfd, int fd)
+void addfd(int epollfd, int fd) //注册内核事件
 {
     epoll_event event;
     event.data.fd = fd;
@@ -62,7 +62,7 @@ void addfd(int epollfd, int fd)
     setnonblocking(fd);
 }
 
-void sig_handler(int sig)
+void sig_handler(int sig) 
 {
     int save_errno = errno;
     int msg = sig;
@@ -112,7 +112,7 @@ int run_child(int idx, client_data *users, char *share_men)
     int pipefd = users[idx].pipefd[1];
     addfd(child_epollfd, pipefd);
     int ret;
-    /*子进程需要设置自己的信号处理函数*/
+    /*子进程需要设置自己的SIGTERM信号处理函数*/
     addsig(SIGTERM, child_term_handler, false);
 
     while (!stop_child) /*stop是一个全局变量，是子进程是否停止的标志*/
@@ -127,7 +127,7 @@ int run_child(int idx, client_data *users, char *share_men)
         for (int i = 0; i < number; i++)
         {
             int sockfd = events[i].data.fd;
-            /*本子进程负责的客户链接有数据到达*/
+            /*本子进程负责的客户链接有数据到达，将数据放入共享内存的适当位置后通过pipefd管道通知父进程第几个连接上有数据到达服务器，以便父进程将该数据分发到其他连接中*/
             if (sockfd == connfd && (events[i].events & EPOLLIN))
             {
                 memset(share_mem + idx*BUFFER_SIZE, '\0', BUFFER_SIZE);
@@ -140,21 +140,21 @@ int run_child(int idx, client_data *users, char *share_men)
                         stop_child = true;
                     }
                 }
-                else if (ret == 0)
+                else if (ret == 0) //连接断开，关闭子进程
                 {
                     stop_child = true;
                 }
                 else
                 {
-                    /*成功读取客户数据后就通知主进程(通过管道)来处理*/
+                    /*成功读取客户数据后就通知主进程(通过管道)来处理。通知主进程第几个连接有数据*/
                     send(pipefd, (char*)&idx, sizeof(idx), 0);
                 }
             }
-            /*主进程通知本进程（通过管道）将第client个客户的数据发送到本进程负责的客户端*/
+            /*主进程通知本进程（通过管道pipefd[1]）将第client个客户的数据发送到本进程负责的客户端,主要是client参数*/
             else if ((sockfd == pipefd) && (events[i].events & EPOLLIN))
             {
                 int client = 0;
-                /*接收主进程发送来的数据，即有客户数据到达的连接的编号*/
+                /*接收主进程发送来的数据，即有客户数据到达的连接的编号（主进程发送的是编号？）*/
                 ret = recv(sockfd, (char*)&client, sizeof(client), 0);
                 if (ret < 0)
                 {
@@ -223,7 +223,7 @@ int main(int argc, char *argv[])
     assert(epollfd != -1);
     addfd(epollfd, listenfd);
 
-    ret = socketpair(PF_UNIX, SOCK_STREAM, 0, sig_pipefd);
+    ret = socketpair(PF_UNIX, SOCK_STREAM, 0, sig_pipefd);//这个是全局的双向管道
     assert(ret != -1);
     setnonblocking(sig_pipefd[1]);
     addfd(epollfd, sig_pipefd[0]);
@@ -279,30 +279,30 @@ int main(int argc, char *argv[])
                 users[user_count].address = client_address;
                 users[user_count].connfd = connfd;
                 /*在主进程和子进程之间建立管道，以传递必要的数据*/
-                ret = socketpair(PF_UNIX, SOCK_STREAM, 0, users[user_count].pipefd);
+                ret = socketpair(PF_UNIX, SOCK_STREAM, 0, users[user_count].pipefd); //建立管道
                 assert(ret != -1);
-                pid_t pid = fork();
+                pid_t pid = fork(); //给新的连接分配一个子进程处理。子进程会继承父进程的信号处理函数，所以对于添加的几个信号处理的办法是通过管道，发送给父进程
                 if (pid < 0)
                 {
                     close(connfd);
                     continue;
                 }
-                else if (pid == 0)
+                else if (pid == 0)  //子进程
                 {
                     close(epollfd);
                     close(listenfd);
-                    close(users[user_count].pipefd[0]);
-                    close(sig_pipefd[0]);
-                    close(sig_pipefd[1]);
+                    close(users[user_count].pipefd[0]); //子进程关闭pipefd[0],这意味着子进程可以给父进程发送信息，而父进程只能接收信息
+                    close(sig_pipefd[0]);   //关闭全局的一个管道
+                    close(sig_pipefd[1]);   //question：如果子进程关闭了管道sig_pipefd[],那么如果在子进程中有信号发生时，还能通过继承的信号处理程序通过管道发送信息给父进程吗？0
                     run_child(user_count, users, share_mem);
                     munmap((void*)share_mem, USER_LIMIT * BUFFER_SIZE);
                     exit(0);
                 }
-                else
+                else        //父进程
                 {
-                    close(connfd);
-                    close(users[user_count].pipefd[1]);
-                    addfd(epollfd, users[user_count].pipefd[0]);
+                    close(connfd);//关闭父进程的连接socket，是因为子进程继承了父进程的打开文件，并且不需要父进程处理连接数据，所以关闭父进程的连接socket connfd
+                    close(users[user_count].pipefd[1]);//主进程关闭pipefd[1]
+                    addfd(epollfd, users[user_count].pipefd[0]);//把pipefd[0]上的数据可读事件写入内核
                     users[user_count].pid = pid;
                     /*记录新的客户连接在数组users中得索引值，建立进程pid和该索引之间的映射关系*/
                     sub_process[pid] = user_count;
@@ -346,7 +346,7 @@ int main(int argc, char *argv[])
                                     /*清除第del_user个客户连接使用的相关数据*/
                                     epoll_ctl(epollfd, EPOLL_CTL_DEL, users[del_user].pipefd[0], 0);
                                     close(users[del_user].pipefd[0]);
-                                    users[del_user] = users[--user_count];
+                                    users[del_user] = users[--user_count];//把最大的边界数据往前挪
                                     sub_process[users[del_user].pid] = del_user;
                                 }
                                 if (terminate && user_count == 0)
