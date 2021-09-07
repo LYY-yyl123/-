@@ -52,7 +52,7 @@ public:
 
     /*启动线程池*/
     void run();
-pricvate:
+private:
     void setup_sig_pipe();
     void run_parent();
     void run_child();
@@ -63,7 +63,7 @@ private:
     /*每个子进程能处理的客户数量*/
     static const int USER_PER_PROCESS = 65535;
     /*epoll最多能处理的事件数*/
-    static const int MAX_ENENT_NUMBER = 10000;
+    static const int MAX_EVENT_NUMBER = 10000;
     /*进程池中的进程总数量*/
     int m_process_number;
     /*子进程在池中的序号，从0开始*/
@@ -162,7 +162,7 @@ processpool<T>::processpool (int listenfd, int process_number):m_listenfd(listen
 
 /*统一事件源*/
 template<typename T>
-void  processpool<T>::setup_sig_pipe()
+void processpool<T>::setup_sig_pipe()
 {
     /*创建epoll事件监听列表和信号管道*/
     m_epollfd= epol_create(5);
@@ -238,12 +238,189 @@ void processpool<T>::run_child()
                         continue;
                     }
                     addfd(m_epollfd, connfd);
-                    /*模板类T必须实现init方法，以初始化一个客户连接。我们直接使用connfd来索引逻辑处理对象(T类型的对象)*/
+                    /*模板类T必须实现init方法，以初始化一个客户连接。我们直接使用connfd来索引逻辑处理对象(T类型的对象),以提高程序效率*/
+                    users[cnnfd].init(m_epollfd， connfd, client_address);
                 }
+            }
+            /*下面处理子进程收到的信号*/
+            else if ((sockfd == sig_pipefd[0]) && (events[i].events & EPOLLIN))
+            {
+                int sig;
+                char signals[1024];
+                ret = recv(sig_pipefd[0], signals, sizeof(signals), 0);
+                if (ret <= 0)
+                {
+                    continue;
+                }
+                else
+                {
+                    for (int i = 0; i < ret; ++i)
+                    {
+                        switch(signals[i])
+                        {
+                            case SIGCHLD:
+                            {
+                                pid_t pid;
+                                int stat;
+                                while ((pid = waitpid(-1, &stat, WNOHANG)) > 0)
+                                {
+                                    continue;
+                                }
+                                break;
+                            }
+                            case SIGTERM:
+                            case SIGINT:
+                            {
+                                m_stop = true;
+                                break;
+                            }
+                            default:
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            /*如果是其他可读数据，那么必然是客户请求到来。调用逻辑处理对象的process方法处理之*/
+            else if (events[i].events & EPOLLIN)
+            {
+                users[sockfd].process();
+            }
+            else
+            {
+                continue;
             }
         }
     }
+    delete [] users;
+    users = NULL;
+    close(pipefd);
+    //close(m_listenfd); /*我们将这句注释掉，以提醒读者：应该由m_listenfd的创建者来关闭这个文件描述符（见后文），即所谓的对象（比如一个文件描述符，又或者一段堆内存）由那个函数创建，就应该由那个函数销毁*/
+    close(m_epollfd);
 }
 
+template<typename T>
+void processpool<T>::run_parent()
+{
+    setup_sig_pipe();
+    /*父进程监听m_listenfd*/
+    addfd(m_epollfd, m_listenfd);
+
+    epoll_event events[MAX_EVENT_NUMBER];
+    int sub_process_counter = 0;
+    int new_conn = 1;
+    int number = 0;
+    int ret = -1;
+
+    while (!m_stop)
+    {
+        number = epoll_wait(m_epollfd, events, MAX_EVENT_NUMBER, -1);
+        if ((number < 0) && (errno != EINTR))
+        {
+            printf("epoll failure\n");
+            break;
+        }
+        for (int i = 0; i < number; i++)
+        {
+            int sockfd = events[i].data.fd;
+            if (sockfd == m_listenfd)
+            {
+                /*如果有新连接到来，就采用Round Robin方法将其分配给一个子进程处理*/
+                int i = sub_process_counter;
+                do
+                {
+                    if (m_sub_process[i].m_pid != -1)
+                    {
+                        break;
+                    }
+                    i = (i + 1) % m_process_number;
+                } while (i != sub_process_counter);
+                
+                if (m_sub_process[i].m_pid == -1)
+                {
+                    m_stop = true;
+                    break;
+                }
+                sub_process_counter = (i + 1) % m_process_number;
+                send(m_sub_process[i].m_pipefd[0], (char*)&new_conn, sizeof(new_conn), 0);
+                printf("send request to child %d\n", i);
+            }
+            /*下面处理父进程接收到的信号*/
+            else if ((sockfd == sig_pipefd[0]) && (events[i].events & EPOLLIN))
+            {
+                int sig;
+                char signals[1024];
+                ret = recv(sig_pipefd[0], signals, sizeof(signals), 0);
+                if (ret <= 0)
+                {
+                    continue;
+                }
+                else
+                {
+                    for (int i = 0; i < ret; ++i)
+                    {
+                        switch(signals[i])
+                        {
+                            case SIGCHLD:
+                            {
+                                pid_t pid;
+                                int stat;
+                                while ((pid = waitpid(-1, &stat, WNOHANG)) > 0)
+                                {
+                                    for (int i = 0; i < m_process_number; ++i)
+                                    {
+                                        /*如果进程池中第I个子进程退出了，则主进程关闭相应的通信管道，并设置相应的m_pi为-1，以标记该子进程已经退出*/
+                                        if (m_sub_process[i].m_pid == pid)
+                                        {
+                                            printf("child %d join\n", i);
+                                            close(m_sub_process[i].m_pipefd[0]);
+                                            m_sub_process[i].m_pid = -1;
+                                        }
+                                    }
+                                }
+                                /*如果所有子进程都已经退出了，则父进程也退出*/
+                                m_stop  = true;
+                                for (int i = 0; i < m_process_number; ++i)
+                                {
+                                    if (m_sub_process[i].m_pid != -1)
+                                    {
+                                        m_stop = false;
+                                    }
+                                }
+                                break;
+                            }
+                            case SIGTERM:
+                            case SIGINT:
+                            {
+                                /*如果父进程接收到终止信号，那么就杀死所有子进程，并等待他们全部结束。当然，通知子进程结束更好的方法是向其父进程，子进程之间的管道发送特殊数据，读者不妨自己实现*/
+                                printf("kill all the child now\n");
+                                for (int i = 0; i < m_process_number; ++i)
+                                {
+                                    int pid = m_sub_process[i].m_pid;
+                                    if (pid != -1)
+                                    {
+                                        kill(pid, SIGTERM);
+                                    }
+                                }
+                                break;
+                            }
+                            default:
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            else 
+            {
+                continue;
+            }
+        }
+    }
+    //close(m_listenfd); /*由创建者关闭这个文件描述符（见后文）*/
+    close(m_epollfd);
+}
 
 #endif
