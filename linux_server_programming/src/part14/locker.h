@@ -28,7 +28,7 @@ public:
     /*等待信号量*/
     bool wait()
     {
-        return sem_wait(&m_sem) == 0;
+        return sem_wait(&m_sem) == 0; /*sem_wait以原子操作将信号量的值减1.如果信号量的值为0，则sem_wait将被阻塞，直到这个信号量具有非零值*/
     }
 
     /*增加信号量*/
